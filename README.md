@@ -60,7 +60,8 @@ parquet ──► Panel: матрицы [маршрут × время] (y, 6 с�
 | LGBM v1, якоря 8:30–12:30, ×1.03 → сумма 2.194 млрд | 0.349 (raw), 0.321 (×1.03) | 0.341 |
 | то же, сумма 2.21 млрд | | 0.335 |
 | то же, сумма 2.25 млрд | | 0.338 |
-| **то же, сумма 2.23 млрд** | | **0.328** |
+| то же, сумма 2.23 млрд | | 0.328 |
+| **ансамбль v1 L1 + v2 Huber + v2 L2, сумма 2.23 млрд** | 0.3180 (sum_matched) | **0.326** |
 
 Оптимум общей суммы по лидерборду ~2.23 млрд (оценён по трём посылкам выше и подтверждён четвёртой).
 
@@ -107,12 +108,22 @@ uv run python -m forecast.experiment v1_l1 v2_l1 v2_l2 v2_huber
 uv run python -m forecast.blend v2_l1 v2_l2 v2_huber
 ```
 
+Лучшая посылка (0.326): три модели на якорях 8:30–12:30, затем ансамбль, приведённый к сумме 2.23 млрд (множитель 1.031).
+
 ```bash
-uv run python -m forecast.train_predict --name v2_l1 --v2 --rounds 900 --target-sum 2.23e9 --out test.csv
+uv run python -m forecast.train_predict --name f_v1_l1 --rounds 560 --out runs/sub_f_v1_l1.csv
 ```
 
 ```bash
-uv run python -m forecast.train_predict --blend v2_l1:0.6 v2_l2:0.4 --target-sum 2.23e9 --out test.csv
+uv run python -m forecast.train_predict --name f_v2_huber --v2 --no-route-cat --objective huber --rounds 460 --out runs/sub_f_v2_huber.csv
+```
+
+```bash
+uv run python -m forecast.train_predict --name f_v2_l2 --v2 --no-route-cat --objective l2 --rounds 370 --out runs/sub_f_v2_l2.csv
+```
+
+```bash
+uv run python -m forecast.train_predict --blend f_v1_l1:0.436 f_v2_huber:0.312 f_v2_l2:0.252 --target-sum 2.23e9 --out test.csv
 ```
 
 Полное обучение на якорях 8:30–12:30 (~4.9 млн строк) занимает 15–50 минут на ноутбуке, в зависимости от `lr` и числа итераций.
