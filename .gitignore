@@ -1,0 +1,13 @@
+# окружение
+.venv/
+__pycache__/
+*.ipynb_checkpoints
+.DS_Store
+.claude/
+
+# данные соревнования (не распространяем, train ~94 МБ)
+Data/*.parquet
+
+# артефакты: кэши, логи, промежуточные прогнозы, посылки
+runs/
+/test*.csv
