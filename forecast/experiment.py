@@ -65,6 +65,9 @@ VARIANTS = {
     "v2_l1_s1": dict(fs="v2", objective="l1", seed=1),
     "v2_l1_s2": dict(fs="v2", objective="l1", seed=2),
     "v2_l1_nocat": dict(fs="v2_nocat", objective="l1"),
+    "v2_l2_nocat": dict(fs="v2_nocat", objective="l2"),
+    "v2_huber_nocat": dict(fs="v2_nocat", objective="huber", alpha=0.5),
+    "v1_l2": dict(fs="v1", objective="l2"),
 }
 
 
