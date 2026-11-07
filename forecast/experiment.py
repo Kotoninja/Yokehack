@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import time
 from pathlib import Path
@@ -31,13 +32,23 @@ def is_v2_only(col: str) -> bool:
     return col.startswith(V2_ONLY_PREFIXES) or col.endswith(V2_ONLY_SUFFIXES)
 
 
-def load_or_build(radius: int, val_days: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+V3_ONLY = re.compile(
+    r"^(deconv_|ema_|min_(8|48)$|max_(8|48)$|std_(4|8|16)$|cv_|diff_|lag0_over|m8_over|m4_over|seas_8w|seas_7d_(median|std))"
+)
+
+
+def is_v3_only(col: str) -> bool:
+    return bool(V3_ONLY.match(col))
+
+
+def load_or_build(radius: int, val_days: int, version: str = "v2") -> tuple[pd.DataFrame, pd.DataFrame]:
     RUNS.mkdir(exist_ok=True)
-    ptr, pva = RUNS / f"feat_r{radius}_tr.parquet", RUNS / f"feat_r{radius}_va.parquet"
+    prefix = "feat" if version == "v2" else f"feat_{version}"
+    ptr, pva = RUNS / f"{prefix}_r{radius}_tr.parquet", RUNS / f"{prefix}_r{radius}_va.parquet"
     if ptr.exists() and pva.exists():
         return pd.read_parquet(ptr), pd.read_parquet(pva)
     panel = load_panel(ROOT / "Data" / "train_solo_track.parquet")
-    fb = FeatureBuilder(panel, v2=True)
+    fb = FeatureBuilder(panel, v2=True, v3=version == "v3")
     val_anchors = fb.valid_anchors(slot=TEST_SLOT)[-val_days:]
     slots = range(TEST_SLOT - radius, TEST_SLOT + radius + 1)
     tr_anchors = np.sort(np.concatenate([fb.valid_anchors(slot=s) for s in slots]))
@@ -70,6 +81,14 @@ VARIANTS = {
     "v1_l2": dict(fs="v1", objective="l2"),
     "cb_rmse": dict(fs="v2_nocat", lib="cb", loss="RMSE"),
     "cb_mae": dict(fs="v2_nocat", lib="cb", loss="MAE"),
+    # признаки v3 и квантильные цели (по мотивам agent-context/wb-hack)
+    "v3_l1": dict(fs="v3", objective="l1"),
+    "v3_huber": dict(fs="v3", objective="huber", alpha=0.5),
+    "v3_l2": dict(fs="v3", objective="l2"),
+    "v3_q52": dict(fs="v3", objective="quantile", alpha=0.52),
+    "v3_q55": dict(fs="v3", objective="quantile", alpha=0.55),
+    "v3_q58": dict(fs="v3", objective="quantile", alpha=0.58),
+    "v2_q55": dict(fs="v2_nocat", objective="quantile", alpha=0.55),
 }
 
 
@@ -105,10 +124,18 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--decay-days", type=float, default=None, help="вес якоря exp(-возраст/decay), возраст в днях")
     ap.add_argument("--tag", default="", help="суффикс к имени прогона")
+    ap.add_argument("--leaves", type=int, default=63)
+    ap.add_argument("--min-leaf", type=int, default=200)
+    ap.add_argument("--colsample", type=float, default=0.8)
+    ap.add_argument("--subsample", type=float, default=0.8)
+    ap.add_argument("--feat-version", choices=["v2", "v3"], default="v2")
+    ap.add_argument("--train-days", type=int, default=None, help="только последние N дней обучающих якорей")
     args = ap.parse_args()
 
     t0 = time.time()
-    tr, va = load_or_build(args.radius, args.val_days)
+    tr, va = load_or_build(args.radius, args.val_days, args.feat_version)
+    if args.train_days:
+        tr = tr[tr["anchor"] > tr["anchor"].max() - args.train_days * 48].reset_index(drop=True)
     all_feats = feature_columns(tr)
     print(f"rows train={len(tr)} val={len(va)} ({time.time() - t0:.0f}s)", flush=True)
 
@@ -120,6 +147,8 @@ def main() -> None:
         if fs == "v1":
             feats = [c for c in all_feats if not is_v2_only(c)]
         elif fs == "v2_nocat":
+            feats = [c for c in all_feats if c != "route_cat" and not is_v3_only(c)]
+        elif fs == "v3":
             feats = [c for c in all_feats if c != "route_cat"]
         else:
             feats = all_feats
@@ -132,7 +161,7 @@ def main() -> None:
         if cfg.get("lib") == "cb":
             raw_pred, best_iter = fit_catboost(cfg, tr, va, feats, w, seed)
         else:
-            raw_pred, best_iter = fit_lgb(cfg, args.lr, seed, tr, va, feats, cats, w)
+            raw_pred, best_iter = fit_lgb({"num_leaves": args.leaves, "min_data_in_leaf": args.min_leaf, "feature_fraction": args.colsample, "bagging_fraction": args.subsample, **cfg}, args.lr, seed, tr, va, feats, cats, w)
         pred = np.clip(raw_pred, 0, None) * va["scale"]
         out = va[["route_id", "anchor", "k", "target"]].copy()
         out["pred"] = pred
@@ -147,16 +176,12 @@ def main() -> None:
         )
         print(json.dumps(res, ensure_ascii=False), flush=True)
         with open(RUNS / "results.jsonl", "a") as fh:
-            fh.write(json.dumps({**res, "radius": args.radius, "lr": args.lr, "decay": args.decay_days}) + "\n")
+            fh.write(json.dumps({**res, "radius": args.radius, "lr": args.lr, "decay": args.decay_days, "leaves": args.leaves, "min_leaf": args.min_leaf, "colsample": args.colsample, "subsample": args.subsample, "feat": args.feat_version, "train_days": args.train_days}) + "\n")
 
 
 def fit_lgb(cfg: dict, lr: float, seed: int, tr, va, feats: list[str], cats: list[str], w: np.ndarray):
     params = dict(
         learning_rate=lr,
-        num_leaves=63,
-        min_data_in_leaf=200,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
         bagging_freq=1,
         lambda_l2=1.0,
         max_bin=63,
@@ -169,7 +194,7 @@ def fit_lgb(cfg: dict, lr: float, seed: int, tr, va, feats: list[str], cats: lis
     dtr = lgb.Dataset(tr[feats], tr["target_norm"], weight=w, categorical_feature=cats, free_raw_data=False)
     dva = lgb.Dataset(va[feats], va["target_norm"], weight=va["scale"], reference=dtr)
     model = lgb.train(
-        params, dtr, num_boost_round=5000, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)]
+        params, dtr, num_boost_round=20000, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)]
     )
     return model.predict(va[feats], num_iteration=model.best_iteration), model.best_iteration
 

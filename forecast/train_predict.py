@@ -28,11 +28,13 @@ RUNS = ROOT / "runs"
 def train_one(args: argparse.Namespace) -> pd.DataFrame:
     t0 = time.time()
     panel = load_panel(ROOT / "Data" / "train_solo_track.parquet")
-    fb = FeatureBuilder(panel, v2=args.v2)
+    fb = FeatureBuilder(panel, v2=args.v2, v3=args.v3)
     last = panel.n_times - 1
     test_slot = last % STEPS_PER_DAY
     slots = range(test_slot - args.slot_radius, test_slot + args.slot_radius + 1)
     tr_anchors = np.sort(np.concatenate([fb.valid_anchors(slot=s) for s in slots]))
+    if args.train_days:
+        tr_anchors = tr_anchors[tr_anchors > tr_anchors.max() - args.train_days * STEPS_PER_DAY]
     tr = fb.build(tr_anchors)
     te = fb.build(np.array([last]), with_target=False)
     feats = [c for c in feature_columns(tr) if not (args.no_route_cat and c == "route_cat")]
@@ -65,10 +67,10 @@ def train_one(args: argparse.Namespace) -> pd.DataFrame:
         params = dict(
             objective=args.objective,
             learning_rate=args.lr,
-            num_leaves=63,
-            min_data_in_leaf=200,
-            feature_fraction=0.8,
-            bagging_fraction=0.8,
+            num_leaves=args.leaves,
+            min_data_in_leaf=args.min_leaf,
+            feature_fraction=args.colsample,
+            bagging_fraction=args.subsample,
             bagging_freq=1,
             lambda_l2=1.0,
             max_bin=args.max_bin,
@@ -78,6 +80,8 @@ def train_one(args: argparse.Namespace) -> pd.DataFrame:
         )
         if args.objective == "huber":
             params["alpha"] = 0.5
+        elif args.objective == "quantile":
+            params["alpha"] = args.alpha
         model = lgb.train(params, dtr, num_boost_round=args.rounds)
         preds.append(model.predict(te[feats]))
         print(f"seed {seed} done ({time.time() - t0:.0f}s)", flush=True)
@@ -94,6 +98,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="model")
     ap.add_argument("--v2", action="store_true")
+    ap.add_argument("--v3", action="store_true", help="признаки v3 (включает v2)")
+    ap.add_argument("--alpha", type=float, default=0.55, help="квантиль для --objective quantile")
+    ap.add_argument("--leaves", type=int, default=63)
+    ap.add_argument("--min-leaf", type=int, default=200)
+    ap.add_argument("--colsample", type=float, default=0.8)
+    ap.add_argument("--subsample", type=float, default=0.8)
+    ap.add_argument("--train-days", type=int, default=None)
     ap.add_argument("--no-route-cat", action="store_true")
     ap.add_argument("--slot-radius", type=int, default=4)
     ap.add_argument("--lib", choices=["lgb", "cb"], default="lgb")

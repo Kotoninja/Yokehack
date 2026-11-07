@@ -14,3 +14,5 @@ runs/
 
 # логи обучения CatBoost
 catboost_info/
+
+agent-context/

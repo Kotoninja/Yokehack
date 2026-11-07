@@ -71,16 +71,67 @@ class _Windows:
 
 
 MIN_HISTORY = 4 * STEPS_PER_WEEK  # 28 дней истории до якоря
+V3_EMA_SPANS = (8, 24, 96)
+V3_DECONV_PAIRS = (6, 12, 24)
+
+
+def _ema(x: np.ndarray, span: int) -> np.ndarray:
+    """Причинная EMA по последней оси: значение в t использует только индексы <= t."""
+    alpha = 2.0 / (span + 1)
+    out = np.empty_like(x)
+    out[..., 0] = x[..., 0]
+    for t in range(1, x.shape[-1]):
+        out[..., t] = alpha * x[..., t] + (1 - alpha) * out[..., t - 1]
+    return out
 
 
 class FeatureBuilder:
-    def __init__(self, panel: Panel, v2: bool = False):
+    def __init__(self, panel: Panel, v2: bool = False, v3: bool = False):
         self.p = panel
-        self.v2 = v2
+        self.v3 = v3
+        self.v2 = v2 or v3
         self.yw = _Windows(panel.y)
         self.sw = _Windows(panel.s)
         self.gy = panel.y.sum(axis=0)  # суммарный объём по всем маршрутам
         self.gw = _Windows(self.gy)
+        if v3:
+            self.ema = {span: _ema(panel.y, span) for span in V3_EMA_SPANS}
+
+    def _v3_base(self, a: int, scale: np.ndarray) -> dict[str, np.ndarray]:
+        """Признаки по мотивам решения командного трека (agent-context/wb-hack).
+
+        * деконволюция: target_1h(t) ~ x(t) + x(t-1), поэтому получасовой объём
+          x(t) ~ y(t) - y(t-1) + y(t-2) - ... (знакопеременная сумма, усечённая до 2N лагов);
+        * EMA, скользящие min/max/std, приращения, коэффициент вариации, отношения лагов.
+        """
+        y, d = self.p.y, STEPS_PER_DAY
+        yw = self.yw
+        out: dict[str, np.ndarray] = {}
+        for n_pairs in V3_DECONV_PAIRS:
+            idx = np.arange(2 * n_pairs)
+            signs = np.where(idx % 2 == 0, 1.0, -1.0)
+            for off in (0, 1):
+                acc = (y[:, a - off - idx] * signs).sum(axis=1)
+                out[f"deconv_x{off}_n{n_pairs}"] = np.clip(acc, 0, None) / scale
+        for span, arr in self.ema.items():
+            out[f"ema_{span}"] = arr[:, a] / scale
+        out["ema_8_over_96"] = self.ema[8][:, a] / (self.ema[96][:, a] + 1.0)
+        for win in (8, 48):
+            block = y[:, a - win + 1 : a + 1]
+            out[f"min_{win}"] = block.min(axis=1) / scale
+            out[f"max_{win}"] = block.max(axis=1) / scale
+        for win in (4, 8, 16):
+            out[f"std_{win}"] = yw.std(a, win) / scale
+        m48 = yw.mean(a, 48) + 1.0
+        out["cv_48"] = yw.std(a, 48) / m48
+        out["cv_8"] = yw.std(a, 8) / (yw.mean(a, 8) + 1.0)
+        for lag in (1, 2, 4):
+            out[f"diff_{lag}"] = (y[:, a] - y[:, a - lag]) / scale
+        out["lag0_over_m48"] = y[:, a] / m48
+        out["lag0_over_d1"] = y[:, a] / (y[:, a - d] + scale * 0.1)
+        out["m8_over_m48"] = (yw.mean(a, 8) + 1.0) / m48
+        out["m4_over_m336"] = (yw.mean(a, 4) + 1.0) / scale
+        return out
 
     def valid_anchors(self, slot: int | None = None, with_target: bool = True) -> np.ndarray:
         last = self.p.n_times - 1 - (HORIZON if with_target else 0)
@@ -165,6 +216,8 @@ class FeatureBuilder:
 
         if self.v2:
             base.update(self._v2_base(a, scale))
+        if self.v3:
+            base.update(self._v3_base(a, scale))
         base_df = pd.DataFrame(base)
         frames = []
         for k in range(1, HORIZON + 1):
@@ -194,6 +247,16 @@ class FeatureBuilder:
                     [y[:, a - 3 - d * t : a + 1 - d * t].mean(axis=1) for t in range(1, 8)], axis=0
                 )
                 f["shape_fc"] = base_df["lvl_2h"] * f["seas_7d"] / (prof_now / scale + 1e-3)
+            if self.v3:
+                # профиль (маршрут, день недели, слот) за доступные недели, до 8
+                weeks = [t for t in range(1, 9) if j - w * t >= 0]
+                wk = np.stack([y[:, j - w * t] for t in weeks])
+                f["seas_8w_mean"] = wk.mean(axis=0) / scale
+                f["seas_8w_median"] = np.median(wk, axis=0) / scale
+                f["seas_8w_std"] = wk.std(axis=0) / scale
+                dd = np.stack([y[:, j - d * t] for t in range(1, 8)])
+                f["seas_7d_median"] = np.median(dd, axis=0) / scale
+                f["seas_7d_std"] = dd.std(axis=0) / scale
             if with_target:
                 f["target"] = y[:, j]
                 f["target_norm"] = y[:, j] / scale
