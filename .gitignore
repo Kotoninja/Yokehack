@@ -11,3 +11,6 @@ Data/*.parquet
 # артефакты: кэши, логи, промежуточные прогнозы, посылки
 runs/
 /test*.csv
+
+# логи обучения CatBoost
+catboost_info/

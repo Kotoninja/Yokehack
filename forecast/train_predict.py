@@ -5,6 +5,8 @@
   uv run python -m forecast.train_predict --name v2_l1 --v2 --rounds 900 --target-sum 2.23e9
   # ансамбль из уже обученных моделей (runs/test_<name>.parquet)
   uv run python -m forecast.train_predict --blend v2_l1:0.6 v2_l2:0.4 --target-sum 2.23e9
+  # CatBoost
+  uv run python -m forecast.train_predict --name f_cb_mae --lib cb --objective MAE --v2 --no-route-cat --rounds 900
 """
 
 from __future__ import annotations
@@ -37,9 +39,29 @@ def train_one(args: argparse.Namespace) -> pd.DataFrame:
     cats = [c for c in ("dow", "route_cat") if c in feats]
     print(f"train rows={len(tr)} anchors={len(tr_anchors)} feats={len(feats)} ({time.time() - t0:.0f}s)", flush=True)
 
-    dtr = lgb.Dataset(tr[feats], tr["target_norm"], weight=tr["scale"], categorical_feature=cats, free_raw_data=False)
     preds = []
-    for seed in range(args.seeds):
+    if args.lib == "cb":
+        from catboost import CatBoostRegressor, Pool
+
+        pool = Pool(tr[feats], tr["target_norm"], weight=tr["scale"], cat_features=["dow"])
+        for seed in range(args.seeds):
+            model = CatBoostRegressor(
+                loss_function=args.objective,
+                iterations=args.rounds,
+                learning_rate=args.lr,
+                depth=8,
+                border_count=64,
+                random_seed=42 + seed,
+                thread_count=-1,
+                verbose=0,
+            )
+            model.fit(pool)
+            preds.append(model.predict(te[feats]))
+            print(f"seed {seed} done ({time.time() - t0:.0f}s)", flush=True)
+    dtr = None if args.lib == "cb" else lgb.Dataset(
+        tr[feats], tr["target_norm"], weight=tr["scale"], categorical_feature=cats, free_raw_data=False
+    )
+    for seed in range(args.seeds if args.lib == "lgb" else 0):
         params = dict(
             objective=args.objective,
             learning_rate=args.lr,
@@ -74,7 +96,8 @@ def main() -> None:
     ap.add_argument("--v2", action="store_true")
     ap.add_argument("--no-route-cat", action="store_true")
     ap.add_argument("--slot-radius", type=int, default=4)
-    ap.add_argument("--objective", default="l1")
+    ap.add_argument("--lib", choices=["lgb", "cb"], default="lgb")
+    ap.add_argument("--objective", default="l1", help="lgb: l1/l2/huber; cb: MAE/RMSE")
     ap.add_argument("--rounds", type=int, help="число итераций (по валидации)")
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--max-bin", type=int, default=63)

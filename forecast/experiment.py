@@ -68,7 +68,33 @@ VARIANTS = {
     "v2_l2_nocat": dict(fs="v2_nocat", objective="l2"),
     "v2_huber_nocat": dict(fs="v2_nocat", objective="huber", alpha=0.5),
     "v1_l2": dict(fs="v1", objective="l2"),
+    "cb_rmse": dict(fs="v2_nocat", lib="cb", loss="RMSE"),
+    "cb_mae": dict(fs="v2_nocat", lib="cb", loss="MAE"),
 }
+
+
+def fit_catboost(cfg: dict, tr: pd.DataFrame, va: pd.DataFrame, feats: list[str], w: np.ndarray, seed: int):
+    from catboost import CatBoostRegressor, Pool
+
+    model = CatBoostRegressor(
+        loss_function=cfg["loss"],
+        eval_metric="MAE",
+        iterations=5000,
+        learning_rate=0.1,
+        depth=8,
+        border_count=64,
+        random_seed=42 + seed,
+        od_type="Iter",
+        od_wait=100,
+        thread_count=-1,
+        verbose=0,
+    )
+    model.fit(
+        Pool(tr[feats], tr["target_norm"], weight=w, cat_features=["dow"]),
+        eval_set=Pool(va[feats], va["target_norm"], weight=va["scale"], cat_features=["dow"]),
+        use_best_model=True,
+    )
+    return model.predict(va[feats]), model.get_best_iteration()
 
 
 def main() -> None:
@@ -77,6 +103,8 @@ def main() -> None:
     ap.add_argument("--radius", type=int, default=2)
     ap.add_argument("--val-days", type=int, default=14)
     ap.add_argument("--lr", type=float, default=0.1)
+    ap.add_argument("--decay-days", type=float, default=None, help="вес якоря exp(-возраст/decay), возраст в днях")
+    ap.add_argument("--tag", default="", help="суффикс к имени прогона")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -84,8 +112,9 @@ def main() -> None:
     all_feats = feature_columns(tr)
     print(f"rows train={len(tr)} val={len(va)} ({time.time() - t0:.0f}s)", flush=True)
 
-    for name in args.variants:
-        cfg = dict(VARIANTS[name])
+    for variant in args.variants:
+        name = variant + args.tag
+        cfg = dict(VARIANTS[variant])
         fs = cfg.pop("fs")
         seed = cfg.pop("seed", 0)
         if fs == "v1":
@@ -95,32 +124,16 @@ def main() -> None:
         else:
             feats = all_feats
         cats = [c for c in ("dow", "route_cat") if c in feats]
-        params = dict(
-            learning_rate=args.lr,
-            num_leaves=63,
-            min_data_in_leaf=200,
-            feature_fraction=0.8,
-            bagging_fraction=0.8,
-            bagging_freq=1,
-            lambda_l2=1.0,
-            max_bin=63,
-            cat_smooth=50,
-            verbose=-1,
-            seed=42 + seed,
-            **cfg,
-        )
-        dtr = lgb.Dataset(tr[feats], tr["target_norm"], weight=tr["scale"], categorical_feature=cats, free_raw_data=False)
-        dva = lgb.Dataset(va[feats], va["target_norm"], weight=va["scale"], reference=dtr)
+        w = tr["scale"].to_numpy()
+        if args.decay_days:
+            age_days = (tr["anchor"].max() - tr["anchor"].to_numpy()) / 48
+            w = w * np.exp(-age_days / args.decay_days)
         t1 = time.time()
-        # ранняя остановка по взвешенному L1 (== WAPE) независимо от целевой функции
-        model = lgb.train(
-            {**params, "metric": "l1"},
-            dtr,
-            num_boost_round=5000,
-            valid_sets=[dva],
-            callbacks=[lgb.early_stopping(100, verbose=False)],
-        )
-        pred = np.clip(model.predict(va[feats], num_iteration=model.best_iteration), 0, None) * va["scale"]
+        if cfg.get("lib") == "cb":
+            raw_pred, best_iter = fit_catboost(cfg, tr, va, feats, w, seed)
+        else:
+            raw_pred, best_iter = fit_lgb(cfg, args.lr, seed, tr, va, feats, cats, w)
+        pred = np.clip(raw_pred, 0, None) * va["scale"]
         out = va[["route_id", "anchor", "k", "target"]].copy()
         out["pred"] = pred
         out.to_parquet(RUNS / f"val_{name}.parquet")
@@ -128,16 +141,37 @@ def main() -> None:
             name=name,
             raw=round(score(out["target"], out["pred"]), 4),
             sum_matched=round(sum_matched(out, "pred"), 4),
-            best_iter=model.best_iteration,
+            best_iter=best_iter,
             n_feats=len(feats),
             minutes=round((time.time() - t1) / 60, 1),
         )
         print(json.dumps(res, ensure_ascii=False), flush=True)
         with open(RUNS / "results.jsonl", "a") as fh:
-            fh.write(json.dumps({**res, "radius": args.radius, "lr": args.lr}) + "\n")
-        if name == "v2_l1":
-            imp = pd.Series(model.feature_importance("gain"), index=feats).sort_values(ascending=False)
-            print((imp / imp.sum()).head(25).round(4).to_string(), flush=True)
+            fh.write(json.dumps({**res, "radius": args.radius, "lr": args.lr, "decay": args.decay_days}) + "\n")
+
+
+def fit_lgb(cfg: dict, lr: float, seed: int, tr, va, feats: list[str], cats: list[str], w: np.ndarray):
+    params = dict(
+        learning_rate=lr,
+        num_leaves=63,
+        min_data_in_leaf=200,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        lambda_l2=1.0,
+        max_bin=63,
+        cat_smooth=50,
+        verbose=-1,
+        seed=42 + seed,
+        metric="l1",  # ранняя остановка по взвешенному L1 (== WAPE) независимо от целевой функции
+        **cfg,
+    )
+    dtr = lgb.Dataset(tr[feats], tr["target_norm"], weight=w, categorical_feature=cats, free_raw_data=False)
+    dva = lgb.Dataset(va[feats], va["target_norm"], weight=va["scale"], reference=dtr)
+    model = lgb.train(
+        params, dtr, num_boost_round=5000, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)]
+    )
+    return model.predict(va[feats], num_iteration=model.best_iteration), model.best_iteration
 
 
 if __name__ == "__main__":
