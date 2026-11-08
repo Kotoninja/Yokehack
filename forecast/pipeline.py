@@ -10,7 +10,7 @@
      прогноз от последней точки train, смешивание, множитель, проверки, CSV.
 
 Запуск:
-  uv run python -m forecast.pipeline                 # всё целиком (~1 ч на ноутбуке)
+  uv run python -m forecast.pipeline                 # всё целиком (~1.5-2 ч на ноутбуке)
   uv run python -m forecast.pipeline --reuse-validation   # только финал, конфиг из runs/pipeline.json
 """
 
@@ -44,12 +44,13 @@ VAL_DAYS = 14
 LR = 0.1
 ITER_MARGIN = 1.2  # на полных данных строк на ~25% больше -> итераций с запасом
 
-# Состав ансамбля: признаки v3 (кроме CatBoost - v2), разные цели для разнообразия ошибок.
+# Состав ансамбля: признаки v3, разные цели и библиотеки для разнообразия ошибок.
+# seeds - несколько обучений с разными сидами, прогнозы усредняются в одного участника.
 MODELS = {
-    "huber_v3": dict(lib="lgb", fs="v3", objective="huber", alpha=0.5, feature_fraction=0.5, bagging_fraction=0.7),
+    "cb_mae_v3": dict(lib="cb", fs="v3", loss="MAE"),
+    "huber_v3": dict(lib="lgb", fs="v3", objective="huber", alpha=0.5, feature_fraction=0.5, bagging_fraction=0.7, seeds=(0, 1, 2)),
     "q52_v3": dict(lib="lgb", fs="v3", objective="quantile", alpha=0.52),
     "l2_v3": dict(lib="lgb", fs="v3", objective="l2"),
-    "cb_mae_v2": dict(lib="cb", fs="v2", loss="MAE"),
 }
 LGB_BASE = dict(num_leaves=63, min_data_in_leaf=200, feature_fraction=0.8, bagging_fraction=0.8)
 
@@ -60,7 +61,7 @@ def select_features(cols: list[str], fs: str) -> list[str]:
 
 
 def lgb_cfg(spec: dict) -> dict:
-    cfg = {**LGB_BASE, **{k: v for k, v in spec.items() if k not in ("lib", "fs")}}
+    cfg = {**LGB_BASE, **{k: v for k, v in spec.items() if k not in ("lib", "fs", "seeds")}}
     if cfg["objective"] == "l2":
         cfg.pop("alpha", None)
     return cfg
@@ -75,14 +76,17 @@ def validate(level_mode: str) -> dict:
     preds, iters = {}, {}
     for name, spec in MODELS.items():
         feats = select_features(cols, spec["fs"])
-        if spec["lib"] == "cb":
-            raw, it = fit_catboost(spec, tr, va, feats, w, seed=0)
-        else:
-            raw, it = fit_lgb(lgb_cfg(spec), LR, 0, tr, va, feats, ["dow"], w)
-        preds[name] = np.clip(raw, 0, None) * va["scale"].to_numpy()
-        iters[name] = int(it)
+        raws, iters[name] = [], []
+        for seed in spec.get("seeds", (0,)):
+            if spec["lib"] == "cb":
+                raw, it = fit_catboost(spec, tr, va, feats, w, seed=seed)
+            else:
+                raw, it = fit_lgb(lgb_cfg(spec), LR, seed, tr, va, feats, ["dow"], w)
+            raws.append(np.clip(raw, 0, None))
+            iters[name].append(int(it))
+        preds[name] = np.mean(raws, axis=0) * va["scale"].to_numpy()
         out = va[["anchor", "target"]].assign(p=preds[name])
-        print(f"[val] {name:10s} sum_matched={sum_matched(out, 'p'):.4f} iter={it} ({time.time() - t0:.0f}s)", flush=True)
+        print(f"[val] {name:10s} sum_matched={sum_matched(out, 'p'):.4f} iter={iters[name]} ({time.time() - t0:.0f}s)", flush=True)
 
     base = va[["anchor", "target"]].copy()
     p = np.column_stack([preds[n] for n in MODELS])
@@ -137,21 +141,25 @@ def final(cfg: dict, level_mode: str, out_path: Path) -> None:
     blend = np.zeros(len(te))
     for name, spec in MODELS.items():
         feats = select_features(cols, spec["fs"])
-        rounds = int(cfg["iterations"][name] * ITER_MARGIN) + 1
-        if spec["lib"] == "cb":
-            from catboost import CatBoostRegressor, Pool
+        raws = []
+        for seed, it in zip(spec.get("seeds", (0,)), cfg["iterations"][name], strict=True):
+            rounds = int(it * ITER_MARGIN) + 1
+            if spec["lib"] == "cb":
+                from catboost import CatBoostRegressor, Pool
 
-            model = CatBoostRegressor(
-                loss_function=spec["loss"], iterations=rounds, learning_rate=LR, depth=8,
-                border_count=64, random_seed=42, thread_count=-1, verbose=0,
-            )
-            model.fit(Pool(tr[feats], tr["target_norm"], weight=w, cat_features=["dow"]))
-        else:
-            params = dict(learning_rate=LR, bagging_freq=1, lambda_l2=1.0, max_bin=63, verbose=-1, seed=42, **lgb_cfg(spec))
-            model = lgb.train(params, lgb.Dataset(tr[feats], tr["target_norm"], weight=w, categorical_feature=["dow"]), rounds)
-        pred = np.clip(model.predict(te[feats]), 0, None) * te["scale"].to_numpy()
+                model = CatBoostRegressor(
+                    loss_function=spec["loss"], iterations=rounds, learning_rate=LR, depth=8,
+                    border_count=64, random_seed=42 + seed, thread_count=-1, verbose=0,
+                )
+                model.fit(Pool(tr[feats], tr["target_norm"], weight=w, cat_features=["dow"]))
+            else:
+                params = dict(learning_rate=LR, bagging_freq=1, lambda_l2=1.0, max_bin=63, verbose=-1, seed=42 + seed, **lgb_cfg(spec))
+                model = lgb.train(params, lgb.Dataset(tr[feats], tr["target_norm"], weight=w, categorical_feature=["dow"]), rounds)
+            raws.append(np.clip(model.predict(te[feats]), 0, None))
+            print(f"[final] {name:10s} seed={seed} rounds={rounds} ({time.time() - t0:.0f}s)", flush=True)
+        pred = np.mean(raws, axis=0) * te["scale"].to_numpy()
         blend += cfg["weights"][name] * pred
-        print(f"[final] {name:10s} rounds={rounds} sum={pred.sum() / 1e9:.4f} млрд ({time.time() - t0:.0f}s)", flush=True)
+        print(f"[final] {name:10s} sum={pred.sum() / 1e9:.4f} млрд", flush=True)
 
     model_level = blend.sum() * cfg["level_mult"]
     if level_mode == "validation":

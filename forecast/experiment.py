@@ -89,6 +89,11 @@ VARIANTS = {
     "v3_q55": dict(fs="v3", objective="quantile", alpha=0.55),
     "v3_q58": dict(fs="v3", objective="quantile", alpha=0.58),
     "v2_q55": dict(fs="v2_nocat", objective="quantile", alpha=0.55),
+    # разнообразие ансамбля: CatBoost на v3, дополнительные сиды
+    "cb_mae_v3": dict(fs="v3", lib="cb", loss="MAE"),
+    "v3_huber_s1": dict(fs="v3", objective="huber", alpha=0.5, seed=1),
+    "v3_huber_s2": dict(fs="v3", objective="huber", alpha=0.5, seed=2),
+    "v3_q52_s1": dict(fs="v3", objective="quantile", alpha=0.52, seed=1),
 }
 
 
